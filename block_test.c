@@ -32,23 +32,58 @@ struct block_test_dev {
     char bdev_name[DEV_NAME_LEN];
 };
 
+//use to save old context for original bio
+struct bio_context {
+    void *bi_private;
+    void *bi_end_io;
+};
+
 //static DEFINE_SPINLOCK(block_test_lock);
 static struct gendisk *block_test_gendisk = NULL;
 static int block_test_major = 0;
 static struct block_test_dev *bt_dev = NULL;
 static struct request_queue *block_test_queue = NULL;
 
-/*
- * We just receive a bio, print info and then directly return it.
- */
+
+static int block_test_callback(struct bio *bio, int err)
+{
+    struct bio_context *bio_ctx = bio->bi_private;
+
+    bio->bi_private = bio_ctx->bi_private;
+    bio->bi_end_io = bio_ctx->bi_end_io;
+    kfree(bio_ctx);
+    printk("return [%s] io request, end on sector %llu!\n",
+            bio_data_dir(bio) == READ ? "read" : "write",
+            (unsigned long long)bio->bi_sector);
+
+    if (bio->bi_end_io)
+        bio->bi_end_io(bio, err);
+
+    return 0;
+}
+
 static int do_block_test_request(struct request_queue *q, struct bio *bio)
 {
+    struct bio_context *bio_ctx;
     struct block_test_dev *dev = (struct block_test_dev *)q->queuedata;
     printk("device [%s] recevied [%s] io request, access on dev sector[%llu], length is [%u] sectors.\n",
             dev->disk->disk_name,
             bio_data_dir(bio) == READ ? "read" : "write",
             (unsigned long long)bio->bi_sector,
             bio_sectors(bio));
+    bio_ctx = kmalloc(sizeof (struct bio_context), GFP_KERNEL);
+    if (!bio_ctx) {
+        printk("Alloc memory for bio_context failed!\n");
+        bio_endio(bio, -ENOMEM);
+        return 0;
+    }
+    memset(bio_ctx, 0, sizeof(struct bio_context));
+    
+    bio_ctx->bi_private = bio->bi_private;
+    bio_ctx->bi_end_io = bio->bi_end_io;
+    bio->bi_private = bio_ctx;
+    bio->bi_end_io = block_test_callback;
+
     bio->bi_bdev = dev->bdev;
     submit_bio(bio_rw(bio), bio);
     //bio_endio(bio, 0);
@@ -155,6 +190,7 @@ static void __exit block_test_exit(void)
     blk_cleanup_queue(bt_dev->queue);
     del_gendisk(bt_dev->disk);
     put_disk(bt_dev->disk);
+    kfree(bt_dev);
     unregister_blkdev(block_test_major, "block_test");
 }
 
