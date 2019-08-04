@@ -4,7 +4,7 @@
     log_msg(level, __FILE__, __FUNCTION__, __LINE__, msg)
 
 
-//static DEFINE_SPINLOCK(block_test_lock);
+static DEFINE_SPINLOCK(block_test_lock);
 static struct task_struct *log_thread = NULL;
 static struct log_queue *log_q = NULL;
 
@@ -17,6 +17,7 @@ static char msg_to_print[MESSAGE_SIZE];
 /* 
  * Output one log_info line and free its space.
  * */
+#ifdef LOG_TO_FILE
 static void free_log_line(struct log_line_t *log_line, struct file *fp) {
     struct log_info_t *log_info;
 
@@ -26,18 +27,28 @@ static void free_log_line(struct log_line_t *log_line, struct file *fp) {
             log_info->filename, log_info->func_name,
             log_info->line_num, log_info->message);
 
-#ifdef LOG_TO_FILE
     if (fp == NULL || IS_ERR(fp)) 
         printk(msg_to_print);
     else
         fp->f_op->write(fp, msg_to_print, MESSAGE_SIZE, &fp->f_pos);
-#else
-    printk(msg_to_print);
-#endif
 
     kfree(log_info);
     kfree(log_line);
 }
+#else
+static void free_log_line(struct log_line_t *log_line) {
+    struct log_info_t *log_info;
+
+    log_info = log_line->log_info;
+    sprintf(msg_to_print, "%s level:[%d] ## %s:%s:%u,\tMsg: %s", 
+            log_info->utc_time, log_info->level,
+            log_info->filename, log_info->func_name,
+            log_info->line_num, log_info->message);
+    printk(msg_to_print);
+    kfree(log_info);
+    kfree(log_line);
+}
+#endif
 
 /* 
  * Get present UTC time.
@@ -73,10 +84,11 @@ static int log_msg(int level, const char *file, const char *func,
     log_line = kmalloc(sizeof(struct log_line_t), GFP_KERNEL);
     if (!log_line)
         goto line_err;
+    memset(log_line, 0, sizeof(struct log_line_t));
     log_line->log_info = log_info;
     log_line->next = NULL;
 
-    
+    spin_lock_irq(&block_test_lock);
     if (log_q->size) {
         log_q->tail->next = log_line;
         log_q->tail = log_q->tail->next;
@@ -85,6 +97,7 @@ static int log_msg(int level, const char *file, const char *func,
         log_q->tail = log_line;
     }
     log_q->size++;
+    spin_unlock_irq(&block_test_lock);
 
     return 0;
 
@@ -101,10 +114,10 @@ static int batch_log_thread(void *data)
     struct log_queue *thread_log_queue = (struct log_queue *)data;
     struct log_line_t *log_line;
     int schedule_times = 0;
-    struct file *fp = NULL;
 
 #ifdef LOG_TO_FILE
-    mm_segment_t old_fs;
+    struct file *fp = NULL;
+    mm_segment_t *old_fs;
 
     if (fp == NULL)
         fp = filp_open(LOG_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
@@ -119,14 +132,22 @@ static int batch_log_thread(void *data)
     while (!kthread_should_stop()) {
         if (thread_log_queue->size > LOG_BATCH_SIZE || 
                 schedule_times > MAX_SLEEP_TIMES) {
+
+            spin_lock_irq(&block_test_lock);
             schedule_times = thread_log_queue->size > LOG_BATCH_SIZE ? 
                 LOG_BATCH_SIZE : thread_log_queue->size;
             for (; schedule_times > 0; --schedule_times) {
                 log_line = thread_log_queue->head;
+                if (thread_log_queue->head == NULL) printk("Fuck the queue\n");
                 thread_log_queue->head = thread_log_queue->head->next;
+#ifdef LOG_TO_FILE
                 free_log_line(log_line, fp);
+#else
+                free_log_line(log_line);
+#endif
                 thread_log_queue->size--;
             }
+            spin_unlock_irq(&block_test_lock);
         } else {
             schedule_times += 1;
         }
@@ -136,7 +157,11 @@ static int batch_log_thread(void *data)
     for (; thread_log_queue->size != 0; thread_log_queue->size--) {
         log_line = thread_log_queue->head;
         thread_log_queue->head = thread_log_queue->head->next;
+#ifdef LOG_TO_FILE
         free_log_line(log_line, fp);
+#else
+        free_log_line(log_line);
+#endif
     }
 #ifdef LOG_TO_FILE
     set_fs(old_fs);
@@ -394,6 +419,7 @@ static int __init block_test_init(void)
         goto out2;
     }
     memset(log_q, 0, sizeof(struct log_queue));
+    log_q->size = 0;
     log_thread = kthread_run(batch_log_thread, log_q, "block_test_batch_log");
     if (IS_ERR(log_thread)) {
         ret = PTR_ERR(log_thread);
