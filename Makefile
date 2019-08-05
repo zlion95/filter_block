@@ -1,5 +1,5 @@
 
-KERNEL_DIR := /lib/modules/$(shell uname -r)/build
+KERNEL_DIR:=/lib/modules/$(shell uname -r)/build
 obj-m := block_test.o
 
 all:

@@ -12,56 +12,31 @@ static int block_test_major = 0;
 static struct block_test_dev *bt_dev = NULL;
 static struct timex  txc;
 static struct rtc_time tm;
+static char msg_to_print[MESSAGE_SIZE];
 
 /* 
  * Output one log_info line and free its space.
  * */
-static void free_log_line(struct log_line_t *log_line) {
+static void free_log_line(struct log_line_t *log_line, struct file *fp) {
     struct log_info_t *log_info;
+
     log_info = log_line->log_info;
-    printk("%s level:[%d] ## file:%s,\tfunction:%s,\tline:%d,\tMsg: %s\n", 
-        log_info->utc_time, log_info->level,
-        log_info->filename, log_info->func_name,
-        log_info->line_num, log_info->message);
+    sprintf(msg_to_print, "%s level:[%d] ## %s:%s:%u,\tMsg: %s", 
+            log_info->utc_time, log_info->level,
+            log_info->filename, log_info->func_name,
+            log_info->line_num, log_info->message);
+
+#ifdef LOG_TO_FILE
+    if (fp == NULL || IS_ERR(fp)) 
+        printk(msg_to_print);
+    else
+        fp->f_op->write(fp, msg_to_print, MESSAGE_SIZE, &fp->f_pos);
+#else
+    printk(msg_to_print);
+#endif
+
     kfree(log_info);
     kfree(log_line);
-}
-
-/* 
- * Thread to ragularly output batch of log_line.
- * */
-static int batch_log_thread(void *data)
-{
-    struct log_queue *thread_log_queue = (struct log_queue *)data;
-    struct log_line_t *log_line;
-    int schedule_times = 0;
-
-    printk("block_test_thread: Enter thread, data=%d\n", data==NULL ? 0 : 1);
-    while (!kthread_should_stop()) {
-        if (thread_log_queue->size > LOG_BATCH_SIZE || 
-                schedule_times > MAX_SLEEP_TIMES) {
-            schedule_times = thread_log_queue->size > LOG_BATCH_SIZE ? 
-                LOG_BATCH_SIZE : thread_log_queue->size;
-            for (; schedule_times > 0; --schedule_times) {
-                log_line = thread_log_queue->head;
-                thread_log_queue->head = thread_log_queue->head->next;
-                free_log_line(log_line);
-                thread_log_queue->size--;
-            }
-        } else {
-            schedule_times += 1;
-        }
-        schedule_timeout(HZ * 100);
-    }
-
-    printk("block_test_thread: Clean thread, queue_size=%d\n", thread_log_queue->size);
-    for (; thread_log_queue->size != 0; thread_log_queue->size--) {
-        log_line = thread_log_queue->head;
-        thread_log_queue->head = thread_log_queue->head->next;
-        free_log_line(log_line);
-    }
-    printk("block_test_thread: Exit thread, queue_size=%d\n", thread_log_queue->size);
-    return 0;
 }
 
 /* 
@@ -118,6 +93,62 @@ line_err:
     return ret;
 }
 
+/* 
+ * Thread to ragularly output batch of log_line.
+ * */
+static int batch_log_thread(void *data)
+{
+    struct log_queue *thread_log_queue = (struct log_queue *)data;
+    struct log_line_t *log_line;
+    int schedule_times = 0;
+    struct file *fp = NULL;
+
+#ifdef LOG_TO_FILE
+    mm_segment_t old_fs;
+
+    if (fp == NULL)
+        fp = filp_open(LOG_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
+    if (IS_ERR(fp))
+        LOG_MSG(0, "error occured while opening file %s, use printk instead\n");
+
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+#endif
+
+    printk("block_test_thread: Enter thread, data=%d\n", data==NULL ? 0 : 1);
+    while (!kthread_should_stop()) {
+        if (thread_log_queue->size > LOG_BATCH_SIZE || 
+                schedule_times > MAX_SLEEP_TIMES) {
+            schedule_times = thread_log_queue->size > LOG_BATCH_SIZE ? 
+                LOG_BATCH_SIZE : thread_log_queue->size;
+            for (; schedule_times > 0; --schedule_times) {
+                log_line = thread_log_queue->head;
+                thread_log_queue->head = thread_log_queue->head->next;
+                free_log_line(log_line, fp);
+                thread_log_queue->size--;
+            }
+        } else {
+            schedule_times += 1;
+        }
+        schedule_timeout(HZ * 100);
+    }
+
+    for (; thread_log_queue->size != 0; thread_log_queue->size--) {
+        log_line = thread_log_queue->head;
+        thread_log_queue->head = thread_log_queue->head->next;
+        free_log_line(log_line, fp);
+    }
+#ifdef LOG_TO_FILE
+    set_fs(old_fs);
+
+    if (fp != NULL)
+        filp_close(fp, NULL);
+#endif
+
+    return 0;
+}
+
+
 static void block_test_callback(struct bio *bio, int err)
 {
     struct bio_context *bio_ctx = bio->bi_private;
@@ -129,6 +160,8 @@ static void block_test_callback(struct bio *bio, int err)
             bio_data_dir(bio) == READ ? "read" : "write",
             (unsigned long long)bio->bi_sector);
     LOG_MSG(0, msg);
+    kfree(bio_ctx->bvec_sizes);
+    kfree(bio_ctx);
 
     if (bio->bi_end_io)
         bio->bi_end_io(bio, err);
@@ -139,17 +172,10 @@ static int bio_data_record(struct bio *bio, struct block_test_dev *dev, struct b
     char msg[MESSAGE_SIZE];
     struct bio_vec *bvec;
 
-    void *mem_buffer;
-//    void *vdisk_buffer = dev->record_buffer + (bio->bi_sector << SECTOR_BITS);
-
-//    if ((bio->bi_sector << SECTOR_BITS) + bio->bi_size > dev->size)
-//        return -EIO; 
-
     bio_ctx->bi_sector = bio->bi_sector;
     bio_ctx->bi_size = bio->bi_size;
     bio_ctx->bvec_count = bio->bi_vcnt;
 
-    if (bio_data_dir(bio) == READ) return 0;
 
     sprintf(msg, "block_test_dev: [WRITE] bio info bi_sector=%llu, \
 bi_size=%u, bvec_count=%u\n",
@@ -157,8 +183,6 @@ bi_size=%u, bvec_count=%u\n",
             bio->bi_vcnt);
     LOG_MSG(0, msg);
 
-    bio_ctx->total_write_bi_size += bio->bi_size;
-    bio_ctx->total_write_bi_count += 1;
 
     bio_ctx->bvec_sizes = kmalloc(sizeof(int) * bio_ctx->bvec_count, GFP_KERNEL);
     if (!bio_ctx->bvec_sizes)
@@ -167,13 +191,6 @@ bi_size=%u, bvec_count=%u\n",
 
     bio_for_each_segment(bvec, bio, i) {
         bio_ctx->bvec_sizes[i - bio->bi_idx] = bvec->bv_len;
-        /* 
-        mem_buffer = kmap(bvec->bv_page) + bvec->bv_offset;
-        //memcpy(vdisk_buffer, mem_buffer, bvec->bv_len);
-        printk(KERN_NOTICE "copy bio Beyond-end write %d\n", i);
-        kunmap(bvec->bv_page);
-        vdisk_buffer += bvec->bv_len;
-         * */
     }
 
     return 0;
@@ -182,73 +199,89 @@ bi_size=%u, bvec_count=%u\n",
 /* 
  * Check bio from upper device and send to lower device.
  * */
-static int do_block_test_request(struct request_queue *q, struct bio *bio)
-{
-    struct block_test_dev *dev = (struct block_test_dev *)q->queuedata;
-    struct bio_context *bio_ctx = dev->private_data;
+static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
+                            struct device_io_context *io_context) {
+    
+    struct bio_context *bio_ctx;
     char msg[MESSAGE_SIZE];
-    int ret;
+    int ret = 0;
+
+    bio_ctx = kmalloc(sizeof(struct bio_context), GFP_KERNEL);
+    if (!bio_ctx) {
+        LOG_MSG(0, "Alloc memory for bio_context failed!\n");
+        return -ENOMEM;
+    }
+    memset(bio_ctx, 0, sizeof(struct bio_context));
 
     sprintf(msg, "device [%s] recevied [%s] io request, access on dev \
-sector[%llu], length is [%u] sectors.\n",
+%u segs %u sectors from %llu\n",
             dev->disk->disk_name,
             bio_data_dir(bio) == READ ? "read" : "write",
-            (unsigned long long)bio->bi_sector,
-            bio_sectors(bio));
+            bio_segments(bio), 
+            bio_sectors(bio), 
+            (unsigned long long)bio->bi_sector);
     LOG_MSG(0, msg);
     
-    ret = bio_data_record(bio, dev, bio_ctx);
-    if (ret != 0)
-        goto out1;
+    if (bio_data_dir(bio) == WRITE) {
+        ret = bio_data_record(bio, dev, bio_ctx);
+        if (ret != 0)
+            goto err;
+
+        io_context->total_write_bi_size += bio->bi_size;
+        io_context->total_write_bi_count += 1;
+    }
+
     
     bio_ctx->bi_private = bio->bi_private;
     bio_ctx->bi_end_io = bio->bi_end_io;
     bio->bi_private = bio_ctx;
     bio->bi_end_io = block_test_callback;
 
-    // Change the actual bdev to handle this bio
     bio->bi_bdev = dev->bdev;
     submit_bio(bio_rw(bio), bio);
-    //bio_endio(bio, 0);
     return 0;
 
-out1:
-    LOG_MSG(0, "Record bio content fail.\n");
-
+err:
+    LOG_MSG(0, "RecorD bio content fail.\n");
     bio_endio(bio, ret);
-    return 0;
+    kfree(bio_ctx);
+    return ret;
+}
+
+static int block_test_make_request(struct request_queue *q, struct bio *bio)
+{
+    struct block_test_dev *dev = (struct block_test_dev *)q->queuedata;
+    struct device_io_context *io_context = dev->private_data;
+
+    return block_test_bio_req(bio, dev, io_context);
 }
 
 static int block_test_open(struct block_device *bdev, fmode_t mode)
 {
     struct block_test_dev *dev = bdev->bd_disk->private_data;
-    struct bio_context *bio_ctx;
+    struct device_io_context *io_context;
 
-    bio_ctx = kmalloc(sizeof (struct bio_context), GFP_KERNEL);
-    if (!bio_ctx) {
-        LOG_MSG(0, "Alloc memory for bio_context failed!\n");
+    io_context = kmalloc(sizeof (struct device_io_context), GFP_KERNEL);
+    if (!io_context) {
+        LOG_MSG(0, "Alloc memory for io_context failed!\n");
         return -ENOMEM;
     }
-    memset(bio_ctx, 0, sizeof(struct bio_context));
-    dev->private_data = bio_ctx;
+    memset(io_context, 0, sizeof(struct device_io_context));
+    dev->private_data = io_context;
 
-    LOG_MSG(0, "block_test: device is opened\n");
+    LOG_MSG(0, "device is opened\n");
     return 0;
 }
 
 static int block_test_release(struct gendisk *disk, fmode_t mode)
 {
     struct block_test_dev *dev = disk->private_data;
-    struct bio_context *bio_ctx = dev->private_data;
+    struct device_io_context *io_context = dev->private_data;
     char msg[MESSAGE_SIZE];
-    //log_msg(0, __FILE__, __FUNCTION__, __LINE__, msg);
     sprintf(msg, "block_test: total_write_bi_count=%u, total_write_bi_size=%llu",
-            bio_ctx->total_write_bi_count, bio_ctx->total_write_bi_size);
+            io_context->total_write_bi_count, io_context->total_write_bi_size);
     LOG_MSG(0, msg);
-    kfree(bio_ctx->bvec_sizes);
-    kfree(bio_ctx);
-
-//    printk("block_test dump writed data: %s\n", (char *)dev->record_buffer);
+    kfree(io_context);
     LOG_MSG(0, "block_test: device is closed\n");
     return 0;
 }
@@ -274,12 +307,13 @@ static int block_test_dev_init(struct block_test_dev *btdev, int which,
     strncpy(btdev->bdev_name, actual_device_name, device_name_len);
     sprintf(btdev->disk->disk_name, "%s%d", DEVICE_NAME, which);
 
+//    btdev->queue = blk_init_queue(block_test_request, &block_test_lock);
     btdev->queue = blk_alloc_queue(GFP_KERNEL);
 	if (!btdev->queue) {
         printk(KERN_CRIT "alloc queue fail!\n");
 		goto out_free_disk;
     }
-    blk_queue_make_request(btdev->queue, do_block_test_request);
+    blk_queue_make_request(btdev->queue, block_test_make_request);
     btdev->queue->queuedata = btdev;
 
     btdev->disk->major = block_test_major;
@@ -307,16 +341,7 @@ static int block_test_dev_init(struct block_test_dev *btdev, int which,
 #endif
 
     btdev->size = get_capacity(btdev->bdev->bd_disk) << SECTOR_BITS;
-    //btdev->size = 200 << SECTOR_BITS;
     set_capacity(btdev->disk, (btdev->size >> SECTOR_BITS));
-    // Add virtual memory to record some bio data.
-    /* 
-    btdev->record_buffer = vmalloc(btdev->size);
-    if (!btdev->record_buffer) { 
-        printk (KERN_NOTICE "vmalloc failure.\n");
-        goto out_queue;
-    }
-     * */
 
     btdev->disk->queue = btdev->queue;
 

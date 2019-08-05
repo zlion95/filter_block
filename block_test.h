@@ -10,6 +10,9 @@
 #include <linux/timer.h>
 #include <linux/timex.h>
 #include <linux/rtc.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
 
 /*
 #include <linux/timer.h>
@@ -60,15 +63,19 @@ struct block_test_dev {
  * and do some statistic for write process.
  * */
 struct bio_context {
-    unsigned long long total_write_bi_size;
-    unsigned int total_write_bi_count;
-
     void *bi_private;
     void *bi_end_io;
     unsigned int *bvec_sizes;
     sector_t bi_sector;
     unsigned int bi_size;
     unsigned int bvec_count;
+
+    //struct device_io_context *io_context;
+};
+
+struct device_io_context {
+    unsigned long long total_write_bi_size;
+    unsigned int total_write_bi_count;
 };
 
 /*
