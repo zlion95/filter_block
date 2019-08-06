@@ -17,8 +17,10 @@ static char msg_to_print[MESSAGE_SIZE];
 /* 
  * Output one log_info line and free its space.
  * */
+
 #ifdef LOG_TO_FILE
-static void free_log_line(struct log_line_t *log_line, struct file *fp) {
+static void free_log_line(struct log_line_t *log_line, struct file *fp)
+{
     struct log_info_t *log_info;
 
     log_info = log_line->log_info;
@@ -36,7 +38,8 @@ static void free_log_line(struct log_line_t *log_line, struct file *fp) {
     kfree(log_line);
 }
 #else
-static void free_log_line(struct log_line_t *log_line) {
+static void free_log_line(struct log_line_t *log_line)
+{
     struct log_info_t *log_info;
 
     log_info = log_line->log_info;
@@ -53,7 +56,8 @@ static void free_log_line(struct log_line_t *log_line) {
 /* 
  * Get present UTC time.
  * */
-static void get_utc_time(char *utc_time) {
+static void get_utc_time(char *utc_time)
+{
     do_gettimeofday(&(txc.time));
     txc.time.tv_sec -= sys_tz.tz_minuteswest * 60;
     rtc_time_to_tm(txc.time.tv_sec, &tm);
@@ -133,21 +137,22 @@ static int batch_log_thread(void *data)
         if (thread_log_queue->size > LOG_BATCH_SIZE || 
                 schedule_times > MAX_SLEEP_TIMES) {
 
-            spin_lock_irq(&block_test_lock);
             schedule_times = thread_log_queue->size > LOG_BATCH_SIZE ? 
                 LOG_BATCH_SIZE : thread_log_queue->size;
             for (; schedule_times > 0; --schedule_times) {
+                spin_lock_irq(&block_test_lock);
+
                 log_line = thread_log_queue->head;
-                if (thread_log_queue->head == NULL) printk("Fuck the queue\n");
+                thread_log_queue->size--;
                 thread_log_queue->head = thread_log_queue->head->next;
+
+                spin_unlock_irq(&block_test_lock);
 #ifdef LOG_TO_FILE
                 free_log_line(log_line, fp);
 #else
                 free_log_line(log_line);
 #endif
-                thread_log_queue->size--;
             }
-            spin_unlock_irq(&block_test_lock);
         } else {
             schedule_times += 1;
         }
@@ -181,18 +186,21 @@ static void block_test_callback(struct bio *bio, int err)
 
     bio->bi_private = bio_ctx->bi_private;
     bio->bi_end_io = bio_ctx->bi_end_io;
+    /*
     sprintf(msg, "return [%s] io request, end on sector %llu!\n",
             bio_data_dir(bio) == READ ? "read" : "write",
             (unsigned long long)bio->bi_sector);
     LOG_MSG(0, msg);
     kfree(bio_ctx->bvec_sizes);
+     * */
     kfree(bio_ctx);
 
     if (bio->bi_end_io)
         bio->bi_end_io(bio, err);
 }
 
-static int bio_data_record(struct bio *bio, struct block_test_dev *dev, struct bio_context *bio_ctx) {
+static int bio_data_record(struct bio *bio, struct block_test_dev *dev, struct bio_context *bio_ctx)
+{
     int i;
     char msg[MESSAGE_SIZE];
     struct bio_vec *bvec;
@@ -225,7 +233,8 @@ bi_size=%u, bvec_count=%u\n",
  * Check bio from upper device and send to lower device.
  * */
 static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
-                            struct device_io_context *io_context) {
+                            struct device_io_context *io_context)
+{
     
     struct bio_context *bio_ctx;
     char msg[MESSAGE_SIZE];
@@ -238,6 +247,7 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
     }
     memset(bio_ctx, 0, sizeof(struct bio_context));
 
+    /*
     sprintf(msg, "device [%s] recevied [%s] io request, access on dev \
 %u segs %u sectors from %llu\n",
             dev->disk->disk_name,
@@ -255,7 +265,7 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
         io_context->total_write_bi_size += bio->bi_size;
         io_context->total_write_bi_count += 1;
     }
-
+     * */
     
     bio_ctx->bi_private = bio->bi_private;
     bio_ctx->bi_end_io = bio->bi_end_io;
@@ -303,7 +313,7 @@ static int block_test_release(struct gendisk *disk, fmode_t mode)
     struct block_test_dev *dev = disk->private_data;
     struct device_io_context *io_context = dev->private_data;
     char msg[MESSAGE_SIZE];
-    sprintf(msg, "block_test: total_write_bi_count=%u, total_write_bi_size=%llu",
+    sprintf(msg, "all_write_bi_count=%u, all_write_bi_size=%llu\n",
             io_context->total_write_bi_count, io_context->total_write_bi_size);
     LOG_MSG(0, msg);
     kfree(io_context);
