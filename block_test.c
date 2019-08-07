@@ -1,4 +1,10 @@
 #include "block_test.h"
+#include <linux/syscalls.h>
+#include <linux/string.h>
+#include <asm/unistd.h>
+#include <asm/uaccess.h>
+
+#define LOG_TO_FILE 1
 
 #define LOG_MSG(level, msg)     \
     log_msg(level, __FILE__, __FUNCTION__, __LINE__, msg)
@@ -6,50 +12,55 @@
 
 static DEFINE_SPINLOCK(block_test_lock);
 static struct task_struct *log_thread = NULL;
-static struct log_queue *log_q = NULL;
 
 static int block_test_major = 0;
 static struct block_test_dev *bt_dev = NULL;
 static struct timex  txc;
 static struct rtc_time tm;
 static char msg_to_print[MESSAGE_SIZE];
+static struct list_head log_head;
 
 /* 
  * Output one log_info line and free its space.
  * */
 
 #ifdef LOG_TO_FILE
-static void free_log_line(struct log_line_t *log_line, struct file *fp)
+static void free_log_line(struct log_info_t *log_info, struct file *fp, loff_t *pos)
 {
-    struct log_info_t *log_info;
+    unsigned int len = MESSAGE_SIZE;
+    struct iovec iov = { .iov_base = (void *)msg_to_print, .iov_len = len };
+    struct kiocb kiocb;
 
-    log_info = log_line->log_info;
+    memset(msg_to_print, 0, sizeof(msg_to_print));
     sprintf(msg_to_print, "%s level:[%d] ## %s:%s:%u,\tMsg: %s", 
             log_info->utc_time, log_info->level,
             log_info->filename, log_info->func_name,
             log_info->line_num, log_info->message);
 
-    if (fp == NULL || IS_ERR(fp)) 
+    len = strlen(msg_to_print);
+    iov.iov_len = len;
+    init_sync_kiocb(&kiocb, fp);
+    kiocb.ki_pos = *pos;
+    kiocb.ki_left = len;
+
+    if (fp == NULL || IS_ERR(fp)) {
         printk(msg_to_print);
-    else
-        fp->f_op->write(fp, msg_to_print, MESSAGE_SIZE, &fp->f_pos);
+    } else {
+//        fp->f_op->write(fp, msg_to_print, len, &fp->f_pos);
+        fp->f_op->aio_write(&kiocb, &iov, 1, kiocb.ki_pos);
+    }
 
     kfree(log_info);
-    kfree(log_line);
 }
 #else
-static void free_log_line(struct log_line_t *log_line)
+static void free_log_line(struct log_info_t *log_info)
 {
-    struct log_info_t *log_info;
-
-    log_info = log_line->log_info;
     sprintf(msg_to_print, "%s level:[%d] ## %s:%s:%u,\tMsg: %s", 
             log_info->utc_time, log_info->level,
             log_info->filename, log_info->func_name,
             log_info->line_num, log_info->message);
     printk(msg_to_print);
     kfree(log_info);
-    kfree(log_line);
 }
 #endif
 
@@ -70,11 +81,10 @@ static int log_msg(int level, const char *file, const char *func,
                 int line, const char *message)
 {
     struct log_info_t *log_info;
-    struct log_line_t *log_line;
     int ret;
 
     ret = -ENOMEM;
-    log_info = kmalloc(sizeof(struct log_info_t), GFP_KERNEL);
+    log_info = kmalloc(sizeof(struct log_info_t), GFP_ATOMIC);
     if (!log_info)
         return ret;
     memset(log_info, 0, sizeof(struct log_info_t));
@@ -85,29 +95,11 @@ static int log_msg(int level, const char *file, const char *func,
     log_info->line_num = line;
     log_info->level = level;
 
-    log_line = kmalloc(sizeof(struct log_line_t), GFP_KERNEL);
-    if (!log_line)
-        goto line_err;
-    memset(log_line, 0, sizeof(struct log_line_t));
-    log_line->log_info = log_info;
-    log_line->next = NULL;
-
-    spin_lock_irq(&block_test_lock);
-    if (log_q->size) {
-        log_q->tail->next = log_line;
-        log_q->tail = log_q->tail->next;
-    } else {
-        log_q->head = log_line;
-        log_q->tail = log_line;
-    }
-    log_q->size++;
-    spin_unlock_irq(&block_test_lock);
+    spin_lock(&block_test_lock);
+    list_add_tail(&log_info->entry, &log_head);
+    spin_unlock(&block_test_lock);
 
     return 0;
-
-line_err:
-    kfree(log_info);
-    return ret;
 }
 
 /* 
@@ -115,13 +107,14 @@ line_err:
  * */
 static int batch_log_thread(void *data)
 {
-    struct log_queue *thread_log_queue = (struct log_queue *)data;
-    struct log_line_t *log_line;
-    int schedule_times = 0;
+    struct list_head *head = (struct list_head *)data;
+    struct log_info_t *log_info;
+    struct list_head *lpos;
+    loff_t pos;
 
 #ifdef LOG_TO_FILE
     struct file *fp = NULL;
-    mm_segment_t *old_fs;
+    mm_segment_t old_fs;
 
     if (fp == NULL)
         fp = filp_open(LOG_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
@@ -132,42 +125,29 @@ static int batch_log_thread(void *data)
     set_fs(KERNEL_DS);
 #endif
 
-    printk("block_test_thread: Enter thread, data=%d\n", data==NULL ? 0 : 1);
     while (!kthread_should_stop()) {
-        if (thread_log_queue->size > LOG_BATCH_SIZE || 
-                schedule_times > MAX_SLEEP_TIMES) {
-
-            schedule_times = thread_log_queue->size > LOG_BATCH_SIZE ? 
-                LOG_BATCH_SIZE : thread_log_queue->size;
-            for (; schedule_times > 0; --schedule_times) {
-                spin_lock_irq(&block_test_lock);
-
-                log_line = thread_log_queue->head;
-                thread_log_queue->size--;
-                thread_log_queue->head = thread_log_queue->head->next;
-
-                spin_unlock_irq(&block_test_lock);
-#ifdef LOG_TO_FILE
-                free_log_line(log_line, fp);
-#else
-                free_log_line(log_line);
-#endif
-            }
-        } else {
-            schedule_times += 1;
+        spin_lock(&block_test_lock);
+        if (list_empty(head)) {
+            spin_unlock(&block_test_lock);
+            schedule_timeout(HZ * 100);
+            continue;
         }
-        schedule_timeout(HZ * 100);
+        lpos = head->next;
+        log_info = list_entry(lpos, struct log_info_t, entry);
+        list_del(lpos);
+        spin_unlock(&block_test_lock);
+
+        free_log_line(log_info, fp, &pos);
     }
 
-    for (; thread_log_queue->size != 0; thread_log_queue->size--) {
-        log_line = thread_log_queue->head;
-        thread_log_queue->head = thread_log_queue->head->next;
-#ifdef LOG_TO_FILE
-        free_log_line(log_line, fp);
-#else
-        free_log_line(log_line);
-#endif
+    if (!list_empty(head)) {
+        list_for_each(lpos, head) {
+            log_info = list_entry(lpos, struct log_info_t, entry);
+            list_del(lpos);
+            free_log_line(log_info, fp, &pos);
+        }
     }
+
 #ifdef LOG_TO_FILE
     set_fs(old_fs);
 
@@ -186,24 +166,24 @@ static void block_test_callback(struct bio *bio, int err)
 
     bio->bi_private = bio_ctx->bi_private;
     bio->bi_end_io = bio_ctx->bi_end_io;
-    /*
+    kfree(bio_ctx);
+
     sprintf(msg, "return [%s] io request, end on sector %llu!\n",
             bio_data_dir(bio) == READ ? "read" : "write",
             (unsigned long long)bio->bi_sector);
     LOG_MSG(0, msg);
-    kfree(bio_ctx->bvec_sizes);
-     * */
-    kfree(bio_ctx);
+    //kfree(bio_ctx->bvec_sizes);
 
     if (bio->bi_end_io)
         bio->bi_end_io(bio, err);
 }
 
-static int bio_data_record(struct bio *bio, struct block_test_dev *dev, struct bio_context *bio_ctx)
+static int bio_data_record(struct bio *bio, struct block_test_dev *dev, 
+        struct bio_context *bio_ctx)
 {
-    int i;
     char msg[MESSAGE_SIZE];
-    struct bio_vec *bvec;
+    //int i;
+    //struct bio_vec *bvec;
 
     bio_ctx->bi_sector = bio->bi_sector;
     bio_ctx->bi_size = bio->bi_size;
@@ -217,6 +197,7 @@ bi_size=%u, bvec_count=%u\n",
     LOG_MSG(0, msg);
 
 
+    /* 
     bio_ctx->bvec_sizes = kmalloc(sizeof(int) * bio_ctx->bvec_count, GFP_KERNEL);
     if (!bio_ctx->bvec_sizes)
         return -ENOMEM;
@@ -225,6 +206,7 @@ bi_size=%u, bvec_count=%u\n",
     bio_for_each_segment(bvec, bio, i) {
         bio_ctx->bvec_sizes[i - bio->bi_idx] = bvec->bv_len;
     }
+     * */
 
     return 0;
 }
@@ -243,11 +225,11 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
     bio_ctx = kmalloc(sizeof(struct bio_context), GFP_KERNEL);
     if (!bio_ctx) {
         LOG_MSG(0, "Alloc memory for bio_context failed!\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto err1;
     }
     memset(bio_ctx, 0, sizeof(struct bio_context));
 
-    /*
     sprintf(msg, "device [%s] recevied [%s] io request, access on dev \
 %u segs %u sectors from %llu\n",
             dev->disk->disk_name,
@@ -256,16 +238,14 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
             bio_sectors(bio), 
             (unsigned long long)bio->bi_sector);
     LOG_MSG(0, msg);
-    
-    if (bio_data_dir(bio) == WRITE) {
-        ret = bio_data_record(bio, dev, bio_ctx);
-        if (ret != 0)
-            goto err;
 
-        io_context->total_write_bi_size += bio->bi_size;
+    if (bio_data_dir(bio) == WRITE) {
+        //ret = bio_data_record(bio, dev, bio_ctx);
+        //if (ret != 0)
+        //    goto err2;
         io_context->total_write_bi_count += 1;
+        io_context->total_write_bi_size += bio->bi_size;
     }
-     * */
     
     bio_ctx->bi_private = bio->bi_private;
     bio_ctx->bi_end_io = bio->bi_end_io;
@@ -274,13 +254,15 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
 
     bio->bi_bdev = dev->bdev;
     submit_bio(bio_rw(bio), bio);
-    return 0;
+    goto out;
 
-err:
+err2:
     LOG_MSG(0, "RecorD bio content fail.\n");
-    bio_endio(bio, ret);
     kfree(bio_ctx);
-    return ret;
+err1:
+    bio_endio(bio, ret);
+out:
+    return 0;
 }
 
 static int block_test_make_request(struct request_queue *q, struct bio *bio)
@@ -301,7 +283,8 @@ static int block_test_open(struct block_device *bdev, fmode_t mode)
         LOG_MSG(0, "Alloc memory for io_context failed!\n");
         return -ENOMEM;
     }
-    memset(io_context, 0, sizeof(struct device_io_context));
+    io_context->total_write_bi_count = 0;
+    io_context->total_write_bi_size = 0;
     dev->private_data = io_context;
 
     LOG_MSG(0, "device is opened\n");
@@ -313,7 +296,7 @@ static int block_test_release(struct gendisk *disk, fmode_t mode)
     struct block_test_dev *dev = disk->private_data;
     struct device_io_context *io_context = dev->private_data;
     char msg[MESSAGE_SIZE];
-    sprintf(msg, "all_write_bi_count=%u, all_write_bi_size=%llu\n",
+    sprintf(msg, "all_write_bi_count=%d, all_write_bi_size=%llu\n",
             io_context->total_write_bi_count, io_context->total_write_bi_size);
     LOG_MSG(0, msg);
     kfree(io_context);
@@ -423,14 +406,8 @@ static int __init block_test_init(void)
     memset(bt_dev, 0, sizeof(struct block_test_dev));
 
 
-    log_q = kmalloc(sizeof (struct log_queue), GFP_KERNEL);
-    if (!log_q) {
-        printk(KERN_CRIT "kmalloc for log_queue failed!\n");
-        goto out2;
-    }
-    memset(log_q, 0, sizeof(struct log_queue));
-    log_q->size = 0;
-    log_thread = kthread_run(batch_log_thread, log_q, "block_test_batch_log");
+    INIT_LIST_HEAD(&log_head);
+    log_thread = kthread_run(batch_log_thread, &log_head, "block_test_batch_log");
     if (IS_ERR(log_thread)) {
         ret = PTR_ERR(log_thread);
         goto out_thread;
@@ -443,7 +420,7 @@ static int __init block_test_init(void)
     return 0;
 
 out_thread:
-    kfree(log_q);
+    kfree(bt_dev);
 out2:
     unregister_blkdev(block_test_major, "block_test");
 out1:
@@ -473,7 +450,6 @@ static void __exit block_test_exit(void)
     unregister_blkdev(block_test_major, "block_test");
 
     kthread_stop(log_thread);
-    kfree(log_q);
 }
 
 
