@@ -3,6 +3,7 @@
 #include <linux/string.h>
 #include <asm/unistd.h>
 #include <asm/uaccess.h>
+#include <linux/mutex.h>
 
 #define LOG_TO_FILE 1
 
@@ -11,6 +12,7 @@
 
 
 static DEFINE_SPINLOCK(block_test_lock);
+//static struct mutex mutex;
 static struct task_struct *log_thread = NULL;
 
 static int block_test_major = 0;
@@ -96,6 +98,8 @@ static int log_msg(int level, const char *file, const char *func,
     log_info->level = level;
 
     spin_lock(&block_test_lock);
+    if (log_info == NULL)
+        panic("log_info is NULL pointer!\n");
     list_add_tail(&log_info->entry, &log_head);
     spin_unlock(&block_test_lock);
 
@@ -126,13 +130,14 @@ static int batch_log_thread(void *data)
 #endif
 
     while (!kthread_should_stop()) {
-        spin_lock(&block_test_lock);
         if (list_empty(head)) {
-            spin_unlock(&block_test_lock);
             schedule_timeout(HZ * 100);
             continue;
         }
+        spin_lock(&block_test_lock);
         lpos = head->next;
+        if (lpos == NULL)
+            panic("lpos is NULL pointer!\n");
         log_info = list_entry(lpos, struct log_info_t, entry);
         list_del(lpos);
         spin_unlock(&block_test_lock);
@@ -243,8 +248,8 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev,
         //ret = bio_data_record(bio, dev, bio_ctx);
         //if (ret != 0)
         //    goto err2;
-        io_context->total_write_bi_count += 1;
-        io_context->total_write_bi_size += bio->bi_size;
+        //io_context->total_write_bi_count += 1;
+        //io_context->total_write_bi_size += bio->bi_size;
     }
     
     bio_ctx->bi_private = bio->bi_private;
@@ -406,6 +411,7 @@ static int __init block_test_init(void)
     memset(bt_dev, 0, sizeof(struct block_test_dev));
 
 
+//    mutex_init(&mutex);
     INIT_LIST_HEAD(&log_head);
     log_thread = kthread_run(batch_log_thread, &log_head, "block_test_batch_log");
     if (IS_ERR(log_thread)) {

@@ -13,6 +13,7 @@
 #include <linux/mm.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 
 /*
 #include <linux/timer.h>
@@ -75,7 +76,7 @@ struct bio_context {
 
 struct device_io_context {
     unsigned long long total_write_bi_size;
-    unsigned int total_write_bi_count;
+    int total_write_bi_count;
 };
 
 /*
@@ -88,6 +89,7 @@ struct log_info_t {
     char utc_time[UTC_TIME_LEN];
     int level;
     int line_num;
+    struct list_head entry;
 };
 
 /* 
