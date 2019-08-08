@@ -15,13 +15,6 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 
-/*
-#include <linux/timer.h>
-#include <linux/spinlock.h>
-#include <linux/errno.h>
-*/
-#define USE_BDEV_EXCL 1
-
 #define DRIVER_NAME "block test driver"
 #define DRIVER_MINORS 16
 #define DEVICE_NAME "bt_dev"
@@ -49,12 +42,10 @@
 struct block_test_dev {
     struct request_queue *queue;
     struct gendisk *disk;
-    sector_t size;                      // Device size in sectors
-//    void *record_buffer;                // Bio record buffer
+    sector_t size;                          // Device size in sectors
 
     struct file *file;
-    //describ the lower device
-    struct block_device *bdev;
+    struct block_device *bdev;              //describ the lower device
     char bdev_name[DEV_NAME_LEN];
     void *private_data;
 };
@@ -70,8 +61,6 @@ struct bio_context {
     sector_t bi_sector;
     unsigned int bi_size;
     unsigned int bvec_count;
-
-    //struct device_io_context *io_context;
 };
 
 struct device_io_context {
@@ -90,23 +79,6 @@ struct log_info_t {
     int level;
     int line_num;
     struct list_head entry;
-};
-
-/* 
- * Container of one log_info and point to next line.
- * */
-struct log_line_t {
-    struct log_info_t *log_info;
-    struct log_line_t *next;
-};
-
-/* 
- * A queue uses to store and transfer log_info to printer thread.
- * */
-struct log_queue {
-    struct log_line_t *head;
-    struct log_line_t *tail;
-    int size;
 };
 
 
