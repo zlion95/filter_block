@@ -1,0 +1,7 @@
+# block_test
+This is a sample filter driver module. The block_test module will create 
+a virtual block device, and open an actual device as its lower device.
+All bio from upper device will submit to lower device.
+This block_test just recognize which direction of bio. If the dir of bio 
+is WRITE, we will record the info of it and then submit. If the dir of bio 
+is READ, we directly submit it to lower device.
