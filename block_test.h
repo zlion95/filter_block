@@ -14,6 +14,10 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/syscalls.h>
+#include <linux/string.h>
+#include <asm/unistd.h>
+#include <asm/uaccess.h>
 
 #define DRIVER_NAME "block test driver"
 #define DRIVER_MINORS 16
@@ -57,15 +61,6 @@ struct block_test_dev {
 struct bio_context {
     void *bi_private;
     void *bi_end_io;
-    unsigned int *bvec_sizes;
-    sector_t bi_sector;
-    unsigned int bi_size;
-    unsigned int bvec_count;
-};
-
-struct device_io_context {
-    unsigned long long total_write_bi_size;
-    int total_write_bi_count;
 };
 
 /*

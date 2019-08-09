@@ -1,15 +1,10 @@
 #include "block_test.h"
-#include <linux/syscalls.h>
-#include <linux/string.h>
-#include <asm/unistd.h>
-#include <asm/uaccess.h>
 
 #define LOG_MSG(level, msg)     \
     log_msg(level, __FILE__, __FUNCTION__, __LINE__, msg)
 
 
 static DEFINE_SPINLOCK(block_test_lock);
-//static struct mutex mutex;
 static struct task_struct *log_thread = NULL;
 
 static int block_test_major = 0;
@@ -22,7 +17,7 @@ static struct list_head log_head;
 /* 
  * Output one log_info line.
  * */
-static void output_log_info(struct log_info_t *log_info, struct file *fp, loff_t *pos)
+static void output_log_info(struct log_info_t *log_info, struct file *fp)
 {
     unsigned int len = MESSAGE_SIZE;
     int ret;
@@ -82,10 +77,8 @@ static int log_msg(int level, const char *file, const char *func,
  * */
 static int batch_log_thread(void *data)
 {
-    struct list_head *head = (struct list_head *)data;
-    struct log_info_t *log_info;
-    struct list_head *lpos;
-    loff_t pos;
+    struct list_head *head = (struct list_head *)data, temp_head;
+    struct log_info_t *log_info, *nlog_info;
 
     struct file *fp = NULL;
     mm_segment_t old_fs;
@@ -98,25 +91,25 @@ static int batch_log_thread(void *data)
     old_fs = get_fs();
     set_fs(KERNEL_DS);
 
+    INIT_LIST_HEAD(&temp_head);
     while (!kthread_should_stop()) {
-        schedule_timeout(HZ / 10);
-        if (list_empty(head)) 
-            continue;
-        spin_lock(&block_test_lock);
-        lpos = head->next;
-        log_info = list_entry(lpos, struct log_info_t, entry);
-        list_del(lpos);
-        spin_unlock(&block_test_lock);
-
-        output_log_info(log_info, fp, &pos);
-        kfree(log_info);
+        if (!list_empty(head)) {
+            spin_lock(&block_test_lock);
+            list_splice_init(head, &temp_head);
+            spin_unlock(&block_test_lock);
+            list_for_each_entry_safe(log_info, nlog_info, &temp_head, entry) {
+                list_del(&(log_info->entry));
+                output_log_info(log_info, fp);
+                kfree(log_info);
+            }
+        }
+        cond_resched();
     }
 
     if (!list_empty(head)) {
-        list_for_each(lpos, head) {
-            log_info = list_entry(lpos, struct log_info_t, entry);
-            list_del(lpos);
-            output_log_info(log_info, fp, &pos);
+        list_for_each_entry_safe(log_info, nlog_info, head, entry) {
+            list_del(&(log_info->entry));
+            output_log_info(log_info, fp);
             kfree(log_info);
         }
     }
@@ -159,6 +152,13 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev)
     }
     memset(bio_ctx, 0, sizeof(struct bio_context));
 
+    bio_ctx->bi_private = bio->bi_private;
+    bio_ctx->bi_end_io = bio->bi_end_io;
+    bio->bi_private = bio_ctx;
+    bio->bi_end_io = block_test_callback;
+
+    bio->bi_bdev = dev->bdev;
+
 
     if (bio_data_dir(bio) == WRITE) {
         sprintf(msg, "device [%s] recevied [%s] io request, access on dev "
@@ -170,13 +170,7 @@ static int block_test_bio_req(struct bio *bio, struct block_test_dev *dev)
                 (unsigned long long)bio->bi_sector);
         LOG_MSG(0, msg);
     }
-    
-    bio_ctx->bi_private = bio->bi_private;
-    bio_ctx->bi_end_io = bio->bi_end_io;
-    bio->bi_private = bio_ctx;
-    bio->bi_end_io = block_test_callback;
 
-    bio->bi_bdev = dev->bdev;
     submit_bio(bio_rw(bio), bio);
     goto out;
 
